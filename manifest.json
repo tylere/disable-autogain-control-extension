@@ -3,6 +3,7 @@
     "version": "1.2",
     "description": "Disables the automatic microphone gain control enabled by web applications like Google Meet and Hangouts.",
     "manifest_version": 3,
+    "minimum_chrome_version": "111",
     "background": {
         "service_worker": "background.js"
     },
