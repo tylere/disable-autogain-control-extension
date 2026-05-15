@@ -49,25 +49,41 @@ function contentScriptFor(origin) {
     };
 }
 
-async function registerForOrigin(origin) {
-    const id = scriptIdForOrigin(origin);
-    try {
-        const existing = await chrome.scripting.getRegisteredContentScripts({ ids: [id] });
-        if (existing.length) {
-            return;
-        }
-        await chrome.scripting.registerContentScripts([contentScriptFor(origin)]);
-    } catch (e) {
-        console.error("Failed to register content script for", origin, e);
-    }
+// All content-script registration changes go through this single queue. The
+// click/message handlers and the permission-event-driven reconcile would
+// otherwise mutate the same script ID concurrently, producing "Duplicate
+// script ID" / "Nonexistent script ID" errors. Tasks run strictly in order;
+// one task's failure must not stall the queue.
+let registrationQueue = Promise.resolve();
+function serializeRegistration(task) {
+    const next = registrationQueue.then(task, task);
+    registrationQueue = next.catch(() => { });
+    return next;
 }
 
-async function unregisterForOrigin(origin) {
-    try {
-        await chrome.scripting.unregisterContentScripts({ ids: [scriptIdForOrigin(origin)] });
-    } catch (e) {
-        // Not registered (or already gone) — nothing to do.
-    }
+function registerForOrigin(origin) {
+    return serializeRegistration(async () => {
+        const id = scriptIdForOrigin(origin);
+        try {
+            const existing = await chrome.scripting.getRegisteredContentScripts({ ids: [id] });
+            if (existing.length) {
+                return;
+            }
+            await chrome.scripting.registerContentScripts([contentScriptFor(origin)]);
+        } catch (e) {
+            console.error("Failed to register content script for", origin, e);
+        }
+    });
+}
+
+function unregisterForOrigin(origin) {
+    return serializeRegistration(async () => {
+        try {
+            await chrome.scripting.unregisterContentScripts({ ids: [scriptIdForOrigin(origin)] });
+        } catch (e) {
+            // Not registered (or already gone) — nothing to do.
+        }
+    });
 }
 
 /**
@@ -76,7 +92,11 @@ async function unregisterForOrigin(origin) {
  * our own handlers (e.g. revoked via chrome://extensions) and registration
  * drift across updates.
  */
-async function reconcileRegistrations() {
+function reconcileRegistrations() {
+    return serializeRegistration(_reconcileRegistrations);
+}
+
+async function _reconcileRegistrations() {
     try {
         const { origins = [] } = await chrome.permissions.getAll();
         const wanted = new Set(
