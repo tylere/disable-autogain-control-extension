@@ -6,12 +6,6 @@
     "background": {
         "service_worker": "background.js"
     },
-    "web_accessible_resources": [
-        {
-            "resources": ["disableAutogain.js"],
-            "matches": ["<all_urls>"]
-        }
-    ],
     "action": {},
     "permissions": [
         "scripting",
