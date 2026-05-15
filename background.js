@@ -6,6 +6,28 @@
 
 const SCRIPT_ID_PREFIX = "disable-autogain:";
 
+// In-memory mirror of the http/https origins we currently have permission for.
+// chrome.permissions.request() must be the first awaited call in the action
+// click handler to keep the user gesture, so the enable/disable decision has
+// to be made synchronously — hence this set rather than an await on
+// permissions.contains(). Kept in sync by reconcileRegistrations() and
+// re-hydrated on every service-worker spin-up.
+const enabledOrigins = new Set();
+
+async function hydrateEnabledOrigins() {
+    try {
+        const { origins = [] } = await chrome.permissions.getAll();
+        enabledOrigins.clear();
+        for (const p of origins) {
+            if (p.startsWith("http://") || p.startsWith("https://")) {
+                enabledOrigins.add(originFromPattern(p));
+            }
+        }
+    } catch (e) {
+        console.error("Failed to hydrate enabled origins", e);
+    }
+}
+
 /** "https://example.com" -> stable, unique content-script id */
 function scriptIdForOrigin(origin) {
     return SCRIPT_ID_PREFIX + origin;
@@ -63,6 +85,13 @@ async function reconcileRegistrations() {
                 .map(originFromPattern)
         );
 
+        // Keep the synchronous mirror used by the click handler in sync,
+        // including permissions changed via chrome://extensions.
+        enabledOrigins.clear();
+        for (const o of wanted) {
+            enabledOrigins.add(o);
+        }
+
         let registered = [];
         try {
             registered = await chrome.scripting.getRegisteredContentScripts();
@@ -114,30 +143,42 @@ async function updateActionState(tabId, origin) {
 }
 
 chrome.action.onClicked.addListener(async (tab) => {
+    // Parse synchronously: chrome.permissions.request() below must be the
+    // first awaited call or Chrome drops the user gesture and throws
+    // "This function must be called during a user gesture".
+    let origin;
     try {
         const url = new URL(tab.url);
         if (url.protocol !== "http:" && url.protocol !== "https:") {
             // Only handle http/https URLs
             return;
         }
-        const { origin } = url;
-        const originPattern = origin + "/*";
-        const hasPermission = await chrome.permissions.contains({ origins: [originPattern] });
-        if (hasPermission) {
+        origin = url.origin;
+    } catch (e) {
+        // tab.url is undefined for restricted pages (chrome://, Web Store)
+        // even with activeTab; log so real failures are not hidden.
+        console.warn("Could not toggle for this tab:", e);
+        return;
+    }
+
+    const originPattern = origin + "/*";
+    try {
+        if (enabledOrigins.has(origin)) {
+            enabledOrigins.delete(origin);
             await chrome.permissions.remove({ origins: [originPattern] });
             await unregisterForOrigin(origin);
         } else {
+            // First awaited call — keeps the user gesture intact.
             const granted = await chrome.permissions.request({ origins: [originPattern] });
             if (!granted) {
                 return;
             }
+            enabledOrigins.add(origin);
             await registerForOrigin(origin);
         }
         await updateActionState(tab.id, origin);
         chrome.tabs.reload(tab.id);
     } catch (e) {
-        // tab.url is undefined for restricted pages (chrome://, Web Store)
-        // even with activeTab; log so real failures are not hidden.
         console.warn("Could not toggle for this tab:", e);
     }
 });
@@ -180,6 +221,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         ];
         chrome.permissions.request({ origins }).then(async (granted) => {
             if (granted) {
+                for (const p of origins) {
+                    enabledOrigins.add(originFromPattern(p));
+                }
                 await Promise.all(origins.map(p => registerForOrigin(originFromPattern(p))));
             }
             sendResponse(granted);
@@ -199,6 +243,10 @@ chrome.permissions.onAdded.addListener(reconcileRegistrations);
 chrome.permissions.onRemoved.addListener(reconcileRegistrations);
 
 chrome.runtime.onStartup.addListener(reconcileRegistrations);
+
+// onStartup only fires at browser launch, not when the service worker wakes
+// from idle, so repopulate the synchronous mirror on every spin-up.
+hydrateEnabledOrigins();
 
 chrome.runtime.onInstalled.addListener(({ reason, previousVersion }) => {
     chrome.contextMenus.create({
