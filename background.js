@@ -6,6 +6,28 @@
 
 const SCRIPT_ID_PREFIX = "disable-autogain:";
 
+// In-memory mirror of the http/https origins we currently have permission for.
+// chrome.permissions.request() must be the first awaited call in the action
+// click handler to keep the user gesture, so the enable/disable decision has
+// to be made synchronously — hence this set rather than an await on
+// permissions.contains(). Kept in sync by reconcileRegistrations() and
+// re-hydrated on every service-worker spin-up.
+const enabledOrigins = new Set();
+
+async function hydrateEnabledOrigins() {
+    try {
+        const { origins = [] } = await chrome.permissions.getAll();
+        enabledOrigins.clear();
+        for (const p of origins) {
+            if (p.startsWith("http://") || p.startsWith("https://")) {
+                enabledOrigins.add(originFromPattern(p));
+            }
+        }
+    } catch (e) {
+        console.error("Failed to hydrate enabled origins", e);
+    }
+}
+
 /** "https://example.com" -> stable, unique content-script id */
 function scriptIdForOrigin(origin) {
     return SCRIPT_ID_PREFIX + origin;
@@ -27,25 +49,41 @@ function contentScriptFor(origin) {
     };
 }
 
-async function registerForOrigin(origin) {
-    const id = scriptIdForOrigin(origin);
-    try {
-        const existing = await chrome.scripting.getRegisteredContentScripts({ ids: [id] });
-        if (existing.length) {
-            return;
-        }
-        await chrome.scripting.registerContentScripts([contentScriptFor(origin)]);
-    } catch (e) {
-        console.error("Failed to register content script for", origin, e);
-    }
+// All content-script registration changes go through this single queue. The
+// click/message handlers and the permission-event-driven reconcile would
+// otherwise mutate the same script ID concurrently, producing "Duplicate
+// script ID" / "Nonexistent script ID" errors. Tasks run strictly in order;
+// one task's failure must not stall the queue.
+let registrationQueue = Promise.resolve();
+function serializeRegistration(task) {
+    const next = registrationQueue.then(task, task);
+    registrationQueue = next.catch(() => { });
+    return next;
 }
 
-async function unregisterForOrigin(origin) {
-    try {
-        await chrome.scripting.unregisterContentScripts({ ids: [scriptIdForOrigin(origin)] });
-    } catch (e) {
-        // Not registered (or already gone) — nothing to do.
-    }
+function registerForOrigin(origin) {
+    return serializeRegistration(async () => {
+        const id = scriptIdForOrigin(origin);
+        try {
+            const existing = await chrome.scripting.getRegisteredContentScripts({ ids: [id] });
+            if (existing.length) {
+                return;
+            }
+            await chrome.scripting.registerContentScripts([contentScriptFor(origin)]);
+        } catch (e) {
+            console.error("Failed to register content script for", origin, e);
+        }
+    });
+}
+
+function unregisterForOrigin(origin) {
+    return serializeRegistration(async () => {
+        try {
+            await chrome.scripting.unregisterContentScripts({ ids: [scriptIdForOrigin(origin)] });
+        } catch (e) {
+            // Not registered (or already gone) — nothing to do.
+        }
+    });
 }
 
 /**
@@ -54,7 +92,11 @@ async function unregisterForOrigin(origin) {
  * our own handlers (e.g. revoked via chrome://extensions) and registration
  * drift across updates.
  */
-async function reconcileRegistrations() {
+function reconcileRegistrations() {
+    return serializeRegistration(_reconcileRegistrations);
+}
+
+async function _reconcileRegistrations() {
     try {
         const { origins = [] } = await chrome.permissions.getAll();
         const wanted = new Set(
@@ -62,6 +104,13 @@ async function reconcileRegistrations() {
                 .filter(p => p.startsWith("http://") || p.startsWith("https://"))
                 .map(originFromPattern)
         );
+
+        // Keep the synchronous mirror used by the click handler in sync,
+        // including permissions changed via chrome://extensions.
+        enabledOrigins.clear();
+        for (const o of wanted) {
+            enabledOrigins.add(o);
+        }
 
         let registered = [];
         try {
@@ -114,31 +163,65 @@ async function updateActionState(tabId, origin) {
 }
 
 chrome.action.onClicked.addListener(async (tab) => {
+    // Parse synchronously: chrome.permissions.request() below must be the
+    // first awaited call or Chrome drops the user gesture and throws
+    // "This function must be called during a user gesture".
+    let origin;
     try {
         const url = new URL(tab.url);
         if (url.protocol !== "http:" && url.protocol !== "https:") {
             // Only handle http/https URLs
             return;
         }
-        const { origin } = url;
-        const originPattern = origin + "/*";
-        const hasPermission = await chrome.permissions.contains({ origins: [originPattern] });
-        if (hasPermission) {
+        origin = url.origin;
+    } catch (e) {
+        // tab.url is undefined for restricted pages (chrome://, Web Store)
+        // even with activeTab; log so real failures are not hidden.
+        console.warn("Could not toggle for this tab:", e);
+        return;
+    }
+
+    const originPattern = origin + "/*";
+    try {
+        if (enabledOrigins.has(origin)) {
+            enabledOrigins.delete(origin);
             await chrome.permissions.remove({ origins: [originPattern] });
             await unregisterForOrigin(origin);
         } else {
+            // First awaited call — keeps the user gesture intact.
             const granted = await chrome.permissions.request({ origins: [originPattern] });
             if (!granted) {
                 return;
             }
+            enabledOrigins.add(origin);
             await registerForOrigin(origin);
         }
         await updateActionState(tab.id, origin);
         chrome.tabs.reload(tab.id);
     } catch (e) {
-        // tab.url is undefined for restricted pages (chrome://, Web Store)
-        // even with activeTab; log so real failures are not hidden.
         console.warn("Could not toggle for this tab:", e);
+    }
+});
+
+// Re-apply the toolbar badge/title after navigation/reload. onClicked sets it
+// but then reloads the tab, which clears the tab-scoped badge; without this it
+// never comes back. UI only — injection is handled by the registered content
+// script.
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+    if (changeInfo.status !== "loading" && changeInfo.status !== "complete") {
+        return;
+    }
+    if (!tab.url) {
+        return;
+    }
+    try {
+        const { origin, protocol } = new URL(tab.url);
+        if (protocol !== "http:" && protocol !== "https:") {
+            return;
+        }
+        updateActionState(tabId, origin);
+    } catch (e) {
+        // Restricted/unknown tab — leave the default action state.
     }
 });
 
@@ -180,6 +263,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         ];
         chrome.permissions.request({ origins }).then(async (granted) => {
             if (granted) {
+                for (const p of origins) {
+                    enabledOrigins.add(originFromPattern(p));
+                }
                 await Promise.all(origins.map(p => registerForOrigin(originFromPattern(p))));
             }
             sendResponse(granted);
@@ -199,6 +285,10 @@ chrome.permissions.onAdded.addListener(reconcileRegistrations);
 chrome.permissions.onRemoved.addListener(reconcileRegistrations);
 
 chrome.runtime.onStartup.addListener(reconcileRegistrations);
+
+// onStartup only fires at browser launch, not when the service worker wakes
+// from idle, so repopulate the synchronous mirror on every spin-up.
+hydrateEnabledOrigins();
 
 chrome.runtime.onInstalled.addListener(({ reason, previousVersion }) => {
     chrome.contextMenus.create({
