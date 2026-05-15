@@ -183,6 +183,28 @@ chrome.action.onClicked.addListener(async (tab) => {
     }
 });
 
+// Re-apply the toolbar badge/title after navigation/reload. onClicked sets it
+// but then reloads the tab, which clears the tab-scoped badge; without this it
+// never comes back. UI only — injection is handled by the registered content
+// script.
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+    if (changeInfo.status !== "loading" && changeInfo.status !== "complete") {
+        return;
+    }
+    if (!tab.url) {
+        return;
+    }
+    try {
+        const { origin, protocol } = new URL(tab.url);
+        if (protocol !== "http:" && protocol !== "https:") {
+            return;
+        }
+        updateActionState(tabId, origin);
+    } catch (e) {
+        // Restricted/unknown tab — leave the default action state.
+    }
+});
+
 // Keep the toolbar badge/title in sync when switching tabs (no injection here,
 // the registered content script handles that).
 chrome.tabs.onActivated.addListener(async ({ tabId }) => {
