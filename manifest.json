@@ -7,10 +7,11 @@
     "background": {
         "service_worker": "background.js"
     },
-    "action": {},
+    "action": {
+        "default_title": "Disable Automatic Gain Control"
+    },
     "permissions": [
         "scripting",
-        "activeTab",
         "contextMenus"
     ],
     "optional_host_permissions": [
