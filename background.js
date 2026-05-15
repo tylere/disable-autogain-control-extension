@@ -19,7 +19,9 @@ chrome.action.onClicked.addListener(async (tab) => {
             chrome.tabs.reload(tab.id);
         }
     } catch (e) {
-        // Ignore invalid URLs (e.g., chrome-extension://)
+        // tab.url is undefined for restricted pages (chrome://, Web Store)
+        // even with activeTab; log so real failures are not hidden.
+        console.warn("Could not toggle for this tab:", e);
     }
 });
 
