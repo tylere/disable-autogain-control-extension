@@ -22,5 +22,8 @@ After loading the unpacked extension, verify:
 3. With the domain enabled, automatic gain control is disabled there.
 4. On a domain you have **not** enabled, autogain is unaffected.
 5. Click the toolbar button again to revoke — the badge clears, the page reloads, and autogain is restored.
+6. On an enabled site that requests the mic immediately on load (e.g. Google Meet), autogain is disabled even on that first early call (the script now runs at `document_start`).
+7. Restart Chrome with a domain still enabled — autogain stays disabled there without re-enabling (registered content scripts persist).
+8. Revoke the permission via `chrome://extensions` (not the toolbar button) — the injected script stops running on that domain after reload.
 
 > Note: I am not intrested to list this as extension on chrome web store, if you want plz go ahead and do it.
