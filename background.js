@@ -45,7 +45,9 @@ async function injectScriptIfNecessary(tab) {
         if (hasPermission) {
             await chrome.scripting.executeScript({
                 target: { tabId: tab.id, allFrames: true },
-                files: ["installDisableAutogain.js"],
+                files: ["disableAutogain.js"],
+                world: "MAIN",
+                injectImmediately: true,
             });
         }
         await chrome.action.setTitle({

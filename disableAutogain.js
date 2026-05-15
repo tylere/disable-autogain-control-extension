@@ -1,4 +1,8 @@
 (function() {
+    if (window.DISABLE_AUTOGAIN_INSTALLED) {
+        return;
+    }
+    window.DISABLE_AUTOGAIN_INSTALLED = true;
     function setLegacyChromeConstraint(constraint, name, value) {
         if (constraint.mandatory && name in constraint.mandatory) {
             constraint.mandatory[name] = value;
